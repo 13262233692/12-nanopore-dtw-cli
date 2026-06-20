@@ -92,3 +92,9 @@ impl From<clap::Error> for NanoDtwError {
         NanoDtwError::ParseError(e.to_string())
     }
 }
+
+impl From<Box<dyn std::error::Error>> for NanoDtwError {
+    fn from(e: Box<dyn std::error::Error>) -> Self {
+        NanoDtwError::InternalError(e.to_string())
+    }
+}

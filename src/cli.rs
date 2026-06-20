@@ -163,6 +163,10 @@ pub struct AlignArgs {
     /// Use built-in R9 kmer model
     #[arg(long)]
     pub r9_model: bool,
+
+    /// Enable interactive TUI mode
+    #[arg(long)]
+    pub tui: bool,
 }
 
 #[derive(Parser, Debug)]

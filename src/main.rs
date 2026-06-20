@@ -70,15 +70,29 @@ fn run_align(args: nanopore_dtw::cli::AlignArgs) -> Result<(), Box<dyn std::erro
     log::info!("Using {} worker threads", num_threads);
     log::info!("DTW algorithm: {:?}", dtw_algo);
 
-    match run_pipeline(config) {
-        Ok(stats) => {
-            print_stats(&stats);
-            log::info!("Pipeline completed successfully in {:?}", start.elapsed());
-            Ok(())
+    if args.tui {
+        match nanopore_dtw::run_pipeline_with_tui(config) {
+            Ok(stats) => {
+                print_stats(&stats);
+                log::info!("Pipeline completed successfully in {:?}", start.elapsed());
+                Ok(())
+            }
+            Err(e) => {
+                log::error!("Pipeline failed: {}", e);
+                Err(e.into())
+            }
         }
-        Err(e) => {
-            log::error!("Pipeline failed: {}", e);
-            Err(e.into())
+    } else {
+        match run_pipeline(config) {
+            Ok(stats) => {
+                print_stats(&stats);
+                log::info!("Pipeline completed successfully in {:?}", start.elapsed());
+                Ok(())
+            }
+            Err(e) => {
+                log::error!("Pipeline failed: {}", e);
+                Err(e.into())
+            }
         }
     }
 }

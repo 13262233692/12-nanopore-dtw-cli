@@ -3,6 +3,7 @@ use crate::io::SignalReader;
 use crate::reference::ReferenceDictionary;
 use crate::sync::Semaphore;
 use crate::threading::WorkerPool;
+use crate::tui::state::{LogLevel, TuiState};
 use crate::types::{DtwResult, ProcessStats, RawSignal};
 use crossbeam_channel::bounded;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -330,6 +331,197 @@ impl ProcessingPipeline {
         }
 
         pb.finish_with_message("Processing complete");
+
+        let elapsed = start_time.elapsed();
+        let stats = ProcessStats {
+            total_reads,
+            processed_reads: processed,
+            failed_reads: failed,
+            total_bases,
+            elapsed,
+            reads_per_second: if elapsed.as_secs_f64() > 0.0 {
+                processed as f64 / elapsed.as_secs_f64()
+            } else {
+                0.0
+            },
+            bases_per_second: if elapsed.as_secs_f64() > 0.0 {
+                total_bases as f64 / elapsed.as_secs_f64()
+            } else {
+                0.0
+            },
+        };
+
+        Ok(stats)
+    }
+
+    pub fn run_with_paths_tui(
+        &self,
+        input_paths: Vec<PathBuf>,
+        reference: ReferenceDictionary,
+        recursive: bool,
+        tui_state: TuiState,
+        mut output_handler: impl FnMut(DtwResult) -> Result<()>,
+    ) -> Result<ProcessStats> {
+        let extensions = ["fast5", "pod5"];
+        let mut file_paths = Vec::new();
+
+        for path in &input_paths {
+            if path.is_dir() {
+                let files = crate::utils::find_files(path, &extensions, recursive)?;
+                file_paths.extend(files);
+            } else {
+                file_paths.push(path.clone());
+            }
+        }
+
+        if file_paths.is_empty() {
+            return Err(crate::error::NanoDtwError::NoData);
+        }
+
+        tui_state.add_log(LogLevel::Info, format!("Found {} files to process", file_paths.len()));
+
+        let mut total_reads = 0usize;
+        {
+            let semaphore = Semaphore::new(self.max_open_files);
+            for path in &file_paths {
+                let _guard = semaphore.acquire();
+                match crate::io::create_reader(path) {
+                    Ok(reader) => {
+                        total_reads += reader.len();
+                    }
+                    Err(e) => {
+                        tui_state.add_log(LogLevel::Warn, format!("Failed to open file {}: {}", path.display(), e));
+                    }
+                }
+            }
+        }
+
+        tui_state.add_log(LogLevel::Info, format!("Found {} reads across {} files", total_reads, file_paths.len()));
+
+        let (signal_tx, signal_rx) = bounded::<RawSignal>(self.channel_capacity);
+        let (result_tx, result_rx) = bounded::<DtwResult>(self.channel_capacity);
+        let queue_depth_tx = signal_tx.clone();
+
+        let reference_arc = Arc::new(reference);
+        let aligner = crate::dtw::DtwAligner::default();
+
+        let pool = WorkerPool::new(
+            self.num_workers,
+            Arc::clone(&reference_arc),
+            signal_rx,
+            result_tx,
+            aligner,
+        )?;
+
+        let start_time = Instant::now();
+        let mut processed = 0usize;
+        let failed = 0usize;
+        let mut total_bases = 0usize;
+
+        let semaphore = Arc::new(Semaphore::new(self.max_open_files));
+        let signal_semaphore = Semaphore::new(self.max_signal_queue_depth);
+
+        let file_paths_clone = file_paths.clone();
+        let batch_size = self.batch_size;
+        let signal_tx_clone = signal_tx.clone();
+        let signal_semaphore_clone = signal_semaphore.clone();
+        let semaphore_clone = semaphore.clone();
+        let tui_state_clone = tui_state.clone();
+
+        let reader_thread = std::thread::Builder::new()
+            .name("file-reader".to_string())
+            .spawn(move || {
+                let mut active = 0usize;
+                for path in &file_paths_clone {
+                    let _file_guard = semaphore_clone.acquire();
+                    active += 1;
+                    tui_state_clone.set_active_files(active);
+
+                    let reader = match crate::io::create_reader(path) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tui_state_clone.add_log(LogLevel::Warn, format!("Failed to open file {}: {}", path.display(), e));
+                            active = active.saturating_sub(1);
+                            tui_state_clone.set_active_files(active);
+                            continue;
+                        }
+                    };
+
+                    let mut reader = reader;
+                    loop {
+                        while tui_state_clone.is_paused() {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+
+                        let batch = match reader.read_batch(batch_size) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                tui_state_clone.add_log(LogLevel::Warn, format!("Error reading from {}: {}", path.display(), e));
+                                break;
+                            }
+                        };
+
+                        if batch.is_empty() {
+                            break;
+                        }
+
+                        for signal in batch {
+                            let _queue_guard = signal_semaphore_clone.acquire();
+
+                            if signal.samples.is_empty() {
+                                continue;
+                            }
+
+                            if let Err(e) = signal_tx_clone.send(signal) {
+                                tui_state_clone.add_log(LogLevel::Warn, format!("Failed to send signal: {}", e));
+                                break;
+                            }
+                        }
+                    }
+
+                    active = active.saturating_sub(1);
+                    tui_state_clone.set_active_files(active);
+                }
+            })?;
+
+        drop(signal_tx);
+
+        while let Ok(result) = result_rx.recv() {
+            while tui_state.is_paused() {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+
+            total_bases += result.mapped_sequence.len();
+            processed += 1;
+            tui_state.update_processed(processed, total_bases);
+            tui_state.set_queue_depth(queue_depth_tx.len());
+
+            if let Err(e) = output_handler(result) {
+                tui_state.add_log(LogLevel::Warn, format!("Output handler error: {}", e));
+            }
+
+            if processed + failed >= total_reads {
+                break;
+            }
+        }
+
+        reader_thread.join().map_err(|e| {
+            crate::error::NanoDtwError::ThreadError(format!(
+                "Reader thread panicked: {:?}",
+                e
+            ))
+        })?;
+
+        pool.join();
+
+        while let Ok(result) = result_rx.try_recv() {
+            total_bases += result.mapped_sequence.len();
+            processed += 1;
+            tui_state.update_processed(processed, total_bases);
+            if let Err(e) = output_handler(result) {
+                tui_state.add_log(LogLevel::Warn, format!("Output handler error: {}", e));
+            }
+        }
 
         let elapsed = start_time.elapsed();
         let stats = ProcessStats {

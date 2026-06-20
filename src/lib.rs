@@ -11,6 +11,7 @@ pub mod io;
 pub mod reference;
 pub mod sync;
 pub mod threading;
+pub mod tui;
 pub mod types;
 pub mod utils;
 
@@ -161,6 +162,139 @@ pub fn run_pipeline(config: ProcessingConfig) -> Result<ProcessStats> {
     )?;
 
     writer.flush()?;
+
+    Ok(stats)
+}
+
+pub fn run_pipeline_with_tui(config: ProcessingConfig) -> Result<ProcessStats> {
+    use crate::dtw::core::DistanceMetric as CoreMetric;
+    use crate::threading::pipeline::DEFAULT_MAX_OPEN_FILES;
+    use crate::threading::pipeline::DEFAULT_SIGNAL_QUEUE_DEPTH;
+    use crate::tui::state::{LogLevel, TuiState};
+    use crate::tui::TuiApp;
+
+    let mut reference = ReferenceDictionary::new()
+        .with_kmer_size(config.kmer_size);
+
+    if config.use_r9_model {
+        let model = KmerModel::load_r9_model(config.kmer_size);
+        reference = reference.with_kmer_model(model);
+    } else if let Some(model_path) = &config.kmer_model_path {
+        let model = KmerModel::load_from_file(model_path, config.kmer_size)?;
+        reference = reference.with_kmer_model(model);
+    }
+
+    reference.load_from_fasta(&config.reference_path)?;
+    log::info!("Loaded {} reference sequences", reference.len());
+
+    let _output_format = config.output_path.as_ref()
+        .map(|p| FileFormat::from_path(p))
+        .unwrap_or(FileFormat::Sam);
+
+    let mut writer = if let Some(out_path) = &config.output_path {
+        SamBamWriter::new(out_path)?
+    } else if atty::is(atty::Stream::Stdout) {
+        log::info!("Writing to stdout in SAM format");
+        SamBamWriter::stdout(FileFormat::Sam)?
+    } else {
+        SamBamWriter::stdout(FileFormat::Sam)?
+    };
+
+    writer.write_header(reference.sequences())?;
+
+    let mut dtw_config = DtwConfig::default()
+        .with_band_width(config.band_width)
+        .with_metric(match config.distance_metric {
+            DistanceMetric::L1 => CoreMetric::L1,
+            DistanceMetric::L2 => CoreMetric::L2,
+            DistanceMetric::Lp(_) => CoreMetric::Lp(2.0),
+        });
+
+    if let Some(max_dist) = config.max_distance {
+        dtw_config = dtw_config.with_max_distance(max_dist);
+    }
+
+    let _aligner = DtwAligner::new(dtw_config, config.dtw_algorithm);
+    let pipeline = ProcessingPipeline::new(
+        config.num_threads,
+        config.batch_size,
+        config.channel_capacity,
+    )
+    .with_max_open_files(DEFAULT_MAX_OPEN_FILES)
+    .with_max_signal_queue_depth(DEFAULT_SIGNAL_QUEUE_DEPTH);
+
+    let verbose = config.verbose;
+    let _normalize = config.normalize;
+    let _median_filter = config.median_filter;
+    let _downsample = config.downsample_factor;
+    let _min_len = config.min_signal_length;
+    let recursive = config.recursive;
+
+    let input_paths = config.input_paths.clone();
+
+    let extensions = ["fast5", "pod5"];
+    let mut file_paths = Vec::new();
+    for path in &input_paths {
+        if path.is_dir() {
+            let files = crate::utils::find_files(path, &extensions, recursive)?;
+            file_paths.extend(files);
+        } else {
+            file_paths.push(path.clone());
+        }
+    }
+
+    let mut total_reads = 0usize;
+    {
+        let semaphore = crate::sync::Semaphore::new(DEFAULT_MAX_OPEN_FILES);
+        for path in &file_paths {
+            let _guard = semaphore.acquire();
+            if let Ok(reader) = crate::io::create_reader(path) {
+                total_reads += reader.len();
+            }
+        }
+    }
+
+    let tui_state = TuiState::new(total_reads, DEFAULT_SIGNAL_QUEUE_DEPTH, file_paths.len());
+    let tui_state_clone = tui_state.clone();
+
+    let pipeline_handle = std::thread::Builder::new()
+        .name("pipeline-main".to_string())
+        .spawn(move || -> Result<ProcessStats> {
+            let result = pipeline.run_with_paths_tui(
+                input_paths,
+                reference,
+                recursive,
+                tui_state_clone.clone(),
+                |result| {
+                    if verbose {
+                        tui_state_clone.add_log(
+                            LogLevel::Info,
+                            format!(
+                                "Read: {} | Ref: {} | Dist: {:.4}",
+                                result.read_id,
+                                result.reference_id,
+                                result.normalized_distance
+                            ),
+                        );
+                    }
+                    writer.write_dtw_result(&result)?;
+                    Ok(())
+                },
+            )?;
+
+            writer.flush()?;
+            Ok(result)
+        })?;
+
+    let app = TuiApp::new(tui_state)?;
+    app.run(|| {})?;
+
+    let stats = pipeline_handle.join().map_err(|e| {
+        crate::error::NanoDtwError::ThreadError(format!(
+            "Pipeline thread panicked: {:?}",
+            e
+        ))
+    })??;
 
     Ok(stats)
 }
