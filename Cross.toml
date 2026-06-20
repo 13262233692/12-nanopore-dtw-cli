@@ -1,0 +1,29 @@
+[build.env]
+passthrough = [
+    "RUST_BACKTRACE",
+    "OPENSSL_STATIC",
+    "OPENSSL_DIR",
+    "OPENSSL_INCLUDE_DIR",
+    "OPENSSL_LIB_DIR",
+]
+
+[target.x86_64-unknown-linux-gnu]
+pre-build = [
+    "apt-get update && apt-get install -y libhdf5-dev zlib1g-dev",
+]
+
+[target.x86_64-unknown-linux-musl]
+pre-build = [
+    "apt-get update && apt-get install -y musl-tools libhdf5-dev zlib1g-dev",
+]
+image = "rust:latest"
+
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "apt-get update && apt-get install -y gcc-aarch64-linux-gnu libhdf5-dev:arm64 zlib1g-dev:arm64",
+]
+
+[target.aarch64-unknown-linux-musl]
+pre-build = [
+    "apt-get update && apt-get install -y musl-tools gcc-aarch64-linux-gnu",
+]
