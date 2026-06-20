@@ -9,6 +9,7 @@ pub mod dtw;
 pub mod error;
 pub mod io;
 pub mod reference;
+pub mod sync;
 pub mod threading;
 pub mod types;
 pub mod utils;
@@ -78,29 +79,8 @@ impl Default for ProcessingConfig {
 
 pub fn run_pipeline(config: ProcessingConfig) -> Result<ProcessStats> {
     use crate::dtw::core::DistanceMetric as CoreMetric;
-
-    let mut readers = Vec::new();
-    let extensions = ["fast5", "pod5"];
-
-    for path in &config.input_paths {
-        if path.is_dir() {
-            let files = utils::find_files(path, &extensions, config.recursive)?;
-            for file in files {
-                readers.push(io::create_reader(file)?);
-            }
-        } else if path.is_file() {
-            readers.push(io::create_reader(path)?);
-        } else {
-            readers.push(io::create_reader(path)?);
-        }
-    }
-
-    if readers.is_empty() {
-        return Err(NanoDtwError::NoData);
-    }
-
-    let total_reads: usize = readers.iter().map(|r| r.len()).sum();
-    log::info!("Found {} reads across {} files", total_reads, readers.len());
+    use crate::threading::pipeline::DEFAULT_MAX_OPEN_FILES;
+    use crate::threading::pipeline::DEFAULT_SIGNAL_QUEUE_DEPTH;
 
     let mut reference = ReferenceDictionary::new()
         .with_kmer_size(config.kmer_size);
@@ -148,17 +128,22 @@ pub fn run_pipeline(config: ProcessingConfig) -> Result<ProcessStats> {
         config.num_threads,
         config.batch_size,
         config.channel_capacity,
-    );
+    )
+    .with_max_open_files(DEFAULT_MAX_OPEN_FILES)
+    .with_max_signal_queue_depth(DEFAULT_SIGNAL_QUEUE_DEPTH);
 
     let verbose = config.verbose;
     let _normalize = config.normalize;
     let _median_filter = config.median_filter;
     let _downsample = config.downsample_factor;
     let _min_len = config.min_signal_length;
+    let recursive = config.recursive;
 
-    let stats = pipeline.run(
-        readers,
+    let input_paths = config.input_paths.clone();
+    let stats = pipeline.run_with_paths(
+        input_paths,
         reference,
+        recursive,
         |result| {
             if verbose {
                 println!(

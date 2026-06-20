@@ -23,6 +23,12 @@ pub enum NanoDtwError {
     #[error("Signal too short: length={0}, minimum required={1}")]
     SignalTooShort(usize, usize),
 
+    #[error("Signal too long: length={0}, maximum allowed={1}")]
+    SignalTooLong(usize, usize),
+
+    #[error("Thread error: {0}")]
+    ThreadError(String),
+
     #[error("Reference not found: {0}")]
     ReferenceNotFound(String),
 

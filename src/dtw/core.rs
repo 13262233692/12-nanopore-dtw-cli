@@ -128,6 +128,8 @@ pub struct CostMatrix {
 
 impl CostMatrix {
     pub fn new(rows: usize, cols: usize) -> Self {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
         Self {
             data: vec![f32::INFINITY; rows * cols],
             _rows: rows,
@@ -137,16 +139,38 @@ impl CostMatrix {
 
     #[inline]
     pub fn get(&self, i: usize, j: usize) -> f32 {
+        if i >= self._rows || j >= self.cols {
+            log::warn!("CostMatrix index out of bounds: ({}, {}) >= ({}, {})", i, j, self._rows, self.cols);
+            return f32::INFINITY;
+        }
         self.data[i * self.cols + j]
     }
 
     #[inline]
     pub fn set(&mut self, i: usize, j: usize, val: f32) {
+        if i >= self._rows || j >= self.cols {
+            log::warn!("CostMatrix index out of bounds: ({}, {}) >= ({}, {})", i, j, self._rows, self.cols);
+            return;
+        }
         self.data[i * self.cols + j] = val;
     }
 
     #[inline]
     pub fn get_mut(&mut self, i: usize, j: usize) -> &mut f32 {
-        &mut self.data[i * self.cols + j]
+        let idx = if i < self._rows && j < self.cols {
+            i * self.cols + j
+        } else {
+            log::warn!("CostMatrix index out of bounds: ({}, {}) >= ({}, {})", i, j, self._rows, self.cols);
+            0
+        };
+        &mut self.data[idx]
+    }
+
+    pub fn rows(&self) -> usize {
+        self._rows
+    }
+
+    pub fn cols(&self) -> usize {
+        self.cols
     }
 }

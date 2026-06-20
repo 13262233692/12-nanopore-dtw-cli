@@ -52,10 +52,23 @@ impl WorkerPool {
         aligner: &DtwAligner,
         tx: &Sender<DtwResult>,
     ) {
+        use crate::dtw::banded::MAX_SIGNAL_LENGTH;
+
         if signal.samples.len() < 50 {
             log::debug!("Signal too short for {}, skipping", signal.read_id);
             return;
         }
+
+        if signal.samples.len() > MAX_SIGNAL_LENGTH {
+            log::warn!("Signal too long for {}: {} > max {}, will truncate", 
+                signal.read_id, signal.samples.len(), MAX_SIGNAL_LENGTH);
+        }
+
+        let processed_samples: Vec<f32> = if signal.samples.len() > MAX_SIGNAL_LENGTH {
+            signal.samples.iter().take(MAX_SIGNAL_LENGTH).copied().collect()
+        } else {
+            signal.samples.clone()
+        };
 
         let mut best_result: Option<DtwResult> = None;
         let mut best_distance = f32::MAX;
@@ -63,7 +76,17 @@ impl WorkerPool {
         for seq in reference.iter() {
             let ref_currents: Vec<f32> = seq.kmers.iter().map(|k| k.expected_current).collect();
             
-            match aligner.align(&signal.samples, &ref_currents) {
+            if ref_currents.is_empty() {
+                continue;
+            }
+
+            let processed_ref: Vec<f32> = if ref_currents.len() > MAX_SIGNAL_LENGTH {
+                ref_currents.iter().take(MAX_SIGNAL_LENGTH).copied().collect()
+            } else {
+                ref_currents.clone()
+            };
+
+            match aligner.align(&processed_samples, &processed_ref) {
                 Ok(result) => {
                     let normalized_dist = result.total_distance / result.path_length as f32;
                     if normalized_dist < best_distance {
